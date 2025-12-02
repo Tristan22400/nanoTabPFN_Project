@@ -1,8 +1,9 @@
-# nanoTabPFN
+# nanoTabPFN with Deepseek Sparse Attention
 
-Train your own small TabPFN in less than 500 LOC and a few minutes.
+Train your small TabPFN with Deepseek Sparse Attention. 
 
-The purpose of this repository is to be a good starting point for students and researchers that are interested in learning about how TabPFN works under the hood.
+**Key Update:** This repository implements **Deepseek Sparse Attention** to significantly reduce the context length of the attention layer compared to standard Multi-head Attention, enhancing efficiency for tabular data processing.
+
 
 ## Installation
 
