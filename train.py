@@ -456,6 +456,9 @@ def train_coordinate_block_descent(
     lr_tfm: float = 1e-4,
     n_indexer_steps: int = 10,
     n_tfm_steps: int = 10,
+    steps_per_eval: int = 30,
+    patience: int = 5,
+    eval_func: Optional[Callable] = None,
     logger: Optional[CSVLogger] = None
 ) -> Tuple[NanoTabPFNDSAModel, List]:
     """
@@ -501,6 +504,11 @@ def train_coordinate_block_descent(
     criterion = nn.CrossEntropyLoss()
     
     train_time = 0.0
+    eval_history = []
+    
+    best_score = 0.0
+    patience_counter = 0
+    best_model_state = copy.deepcopy(model.state_dict())
     
     # Ensure model is on device
     model.to(device)
@@ -577,6 +585,48 @@ def train_coordinate_block_descent(
                 if logger:
                     logger.log({'stage': log_stage, 'step': step, 'time': train_time, 'loss': loss.item()})
 
+            # Evaluation
+            if step % steps_per_eval == steps_per_eval - 1 and eval_func is not None:
+                
+                # Temporarily switch to eval mode for all parts
+                opt_indexer.eval()
+                opt_tfm.eval()
+                model.eval()
+                
+                classifier = NanoTabPFNClassifier(model, device)
+                scores = eval_func(classifier)
+                eval_history.append((train_time, scores))
+                score_str = " | ".join([f"{k} {v:7.4f}" for k,v in scores.items()])
+                print(f"time {train_time:7.1f}s | loss {loss.item():7.4f} | {score_str}")
+
+                if logger:
+                    log_row = {
+                        'stage': log_stage,
+                        'step': step,
+                        'time': train_time,
+                        'loss': loss.item(),
+                    }
+                    log_row.update(scores)
+                    logger.log(log_row)
+                
+                # --- Early Stopping Check (Maximize Accuracy) ---
+                current_score = scores.get('acc', 0.0)
+                if current_score > best_score:
+                    best_score = current_score
+                    patience_counter = 0
+                    best_model_state = copy.deepcopy(model.state_dict())
+                else:
+                    patience_counter += 1
+                    print(f"No improvement in Score. Patience: {patience_counter}/{patience}")
+                    
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered after {step} steps.")
+                    model.load_state_dict(best_model_state)
+                    break
+                
+                model.train()
+
+
     except KeyboardInterrupt:
         print("Training interrupted by user.")
         
@@ -585,7 +635,7 @@ def train_coordinate_block_descent(
     opt_tfm.eval()
     model.eval()
     
-    return model, []
+    return model, eval_history
 
 class PriorDumpDataLoader(DataLoader):
     """
@@ -747,6 +797,9 @@ if __name__ == "__main__":
                 lr_tfm=1e-4,
                 n_indexer_steps=50, # Train indexer for 50 steps
                 n_tfm_steps=50,     # Then train TFM for 50 steps
+                steps_per_eval=25,
+                patience=5,
+                eval_func=evaluate_model,
                 logger=logger
             )
 
