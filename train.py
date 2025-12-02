@@ -4,7 +4,7 @@ import csv
 import os
 import random
 import time
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable
 
 import h5py
 import numpy as np
@@ -104,7 +104,8 @@ def train_base_model(
     lr: float = 1e-4, 
     device: torch.device = None, 
     steps_per_eval: int = 10, 
-    max_time: float = None, 
+    patience: int = 5,
+    eval_func: Optional[Callable] = None,
     logger: Optional[CSVLogger] = None
 ) -> Tuple[NanoTabPFNModel, List]:
     """
@@ -116,7 +117,7 @@ def train_base_model(
         lr: Learning rate.
         device: Torch device.
         steps_per_eval: Number of steps between internal evaluations.
-        max_time: Maximum training time in seconds.
+        patience: Number of evaluations with no improvement before stopping.
         logger: Optional CSVLogger for tracking metrics.
 
     Returns:
@@ -136,14 +137,14 @@ def train_base_model(
     train_time = 0.0
     eval_history = []
     
-    print(f"Starting Base Training for {max_time if max_time else 'Infinite'}s...")
+    print(f"Starting Base Training (Early Stopping, Patience={patience})...")
+
+    best_score = 0.0
+    patience_counter = 0
+    best_model_state = copy.deepcopy(model.state_dict())
 
     try:
         for step, full_data in enumerate(prior):
-            # --- 1. Time Limit Check ---
-            if max_time and train_time > max_time:
-                print(f"Max training time {max_time}s reached.")
-                break
 
             step_start_time = time.time()
             train_test_split_index = full_data["train_test_split_index"]
@@ -179,37 +180,43 @@ def train_base_model(
             train_time += step_train_duration
 
             # --- 3. Internal Evaluation Step ---
-            if step % steps_per_eval == steps_per_eval - 1:
+            if step % steps_per_eval == steps_per_eval - 1 and eval_func is not None:
                 
                 # Switch to Eval Mode (Activates Consensus Weights)
                 optimizer.eval()
                 model.eval()
 
-                with torch.no_grad():
-                    # Re-run Forward Pass on the SAME batch
-                    val_output = model(data, train_test_split_index=train_test_split_index)
-                    if isinstance(val_output, tuple): val_output = val_output[0]
-                    val_output = val_output.view(-1, val_output.shape[-1])
+                classifier = NanoTabPFNClassifier(model, device)
+                scores = eval_func(classifier)
+                eval_history.append((train_time, scores))
+                score_str = " | ".join([f"{k} {v:7.4f}" for k,v in scores.items()])
+                print(f"time {train_time:7.1f}s | loss {total_loss:7.4f} | {score_str}")
+
+                if logger:
+                    log_row = {
+                        'stage': 'base_train',
+                        'step': step,
+                        'time': train_time,
+                        'loss': total_loss,
+                        'syn_acc': 0, # Not calculating syn_acc anymore
+                    }
+                    log_row.update(scores)
+                    logger.log(log_row)
+
+                # --- Early Stopping Check (Maximize ROC AUC) ---
+                current_score = scores.get('acc', 0.0)
+                if current_score > best_score:
+                    best_score = current_score
+                    patience_counter = 0
+                    best_model_state = copy.deepcopy(model.state_dict())
+                else:
+                    patience_counter += 1
+                    print(f"No improvement in Score. Patience: {patience_counter}/{patience}")
                     
-                    # Calculate Synthetic Metrics
-                    val_preds = val_output.argmax(dim=-1)
-                    correct = (val_preds == targets).float().sum()
-                    total = targets.shape[0]
-                    val_acc = (correct / total).item()
-                    val_loss = criterion(val_output, targets).mean().item()
-
-                    print(f"Time {train_time:7.1f}s | Train Loss {total_loss:7.4f} | Syn Val Loss {val_loss:.4f} | Syn Acc {val_acc:.4f}")
-
-                    if logger:
-                        logger.log({
-                            'stage': 'base_train',
-                            'step': step,
-                            'time': train_time,
-                            'loss': total_loss,
-                            'syn_acc': val_acc,
-                            'acc': val_acc, # Overloading for compatibility
-                            'roc_auc': 0, 'balanced_acc': 0
-                        })
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered after {step} steps.")
+                    model.load_state_dict(best_model_state)
+                    break
 
                 # Restore Train Mode
                 model.train()
@@ -225,8 +232,8 @@ def train_indexer_warmup(
     model: NanoTabPFNDSAModel, 
     prior: DataLoader, 
     device: torch.device, 
-    max_time: float, 
     lr: float = 1e-4, 
+    patience: int = 5,
     logger: Optional[CSVLogger] = None
 ):
     """
@@ -236,20 +243,21 @@ def train_indexer_warmup(
         model: The NanoTabPFNDSAModel.
         prior: DataLoader.
         device: Torch device.
-        max_time: Max warmup time in seconds.
         lr: Learning rate.
+        patience: Number of steps with no improvement before stopping.
         logger: Optional CSVLogger.
     """
-    print(f"Starting Indexer Warmup for {max_time:.1f}s...")
+    print(f"Starting Indexer Warmup (Early Stopping, Patience={patience})...")
     optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
     model.train()
     optimizer.train()
     
     train_time = 0.0
+    best_loss = float('inf')
+    patience_counter = 0
+    best_model_state = copy.deepcopy(model.state_dict())
     
     for step, full_data in enumerate(prior):
-        if train_time > max_time:
-            break
             
         step_start = time.time()
         train_test_split_index = full_data["train_test_split_index"]
@@ -288,20 +296,35 @@ def train_indexer_warmup(
             print(f"Warmup Step {step} | Time {train_time:.1f}s | Loss {loss.item():.4f}")
             if logger:
                 logger.log({
-                    'stage': 'warmup',
+                    'stage': 'indexer_warmup',
                     'step': step,
                     'time': train_time,
                     'loss': loss.item(),
                     'syn_acc': 0, 'acc': 0, 'roc_auc': 0, 'balanced_acc': 0 
                 })
+            
+            # --- Early Stopping Check (using training loss as proxy for warmup) ---
+            # Note: Ideally we'd use a validation set, but for warmup, low loss is the goal.
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                patience_counter = 0
+                best_model_state = copy.deepcopy(model.state_dict())
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience:
+                print(f"Warmup Early stopping triggered after {step} steps.")
+                model.load_state_dict(best_model_state)
+                break
 
 def train_sparse_finetune(
     model: NanoTabPFNDSAModel, 
     prior: DataLoader, 
     device: torch.device, 
-    max_time: float, 
     lr: float = 1e-4, 
     steps_per_eval: int = 30, 
+    patience: int = 5,
+    eval_func: Optional[Callable] = None,
     logger: Optional[CSVLogger] = None
 ) -> Tuple[NanoTabPFNDSAModel, List]:
     """
@@ -311,15 +334,15 @@ def train_sparse_finetune(
         model: The NanoTabPFNDSAModel.
         prior: DataLoader.
         device: Torch device.
-        max_time: Max finetuning time in seconds.
         lr: Learning rate.
         steps_per_eval: Steps between evaluations.
+        patience: Number of evaluations with no improvement before stopping.
         logger: Optional CSVLogger.
 
     Returns:
         Tuple of (trained_model, eval_history).
     """
-    print(f"Starting Sparse Finetune for {max_time:.1f}s...")
+    print(f"Starting Sparse Finetune (Early Stopping, Patience={patience})...")
     
     optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
     criterion = nn.CrossEntropyLoss()
@@ -330,12 +353,11 @@ def train_sparse_finetune(
     train_time = 0.0
     eval_history = []
 
-    best_syn_acc = 0.0
+    best_score = 0.0
+    patience_counter = 0
     best_model_state = copy.deepcopy(model.state_dict())
     
     for step, full_data in enumerate(prior):
-        if train_time > max_time:
-            break
             
         step_start = time.time()
         train_test_split_index = full_data["train_test_split_index"]
@@ -346,12 +368,27 @@ def train_sparse_finetune(
         
         optimizer.zero_grad() 
 
-        # Sparse Train Mode
-        output, _ = model(data, train_test_split_index=train_test_split_index, mode='sparse_train')
+        # Sparse Train Mode (Joint Training)
+        output, aux_data_list = model(data, train_test_split_index=train_test_split_index, mode='joint_train')
         if isinstance(output, tuple): output = output[0]
         output = output.view(-1, output.shape[-1])
         
-        loss = criterion(output, targets).mean()
+        loss_main = criterion(output, targets).mean()
+        
+        # Auxiliary Loss (Indexer Distillation)
+        loss_aux = torch.tensor(0.0, device=device)
+        for aux in aux_data_list:
+            if 'indexer_scores' in aux and 'dense_scores' in aux:
+                # Teacher (Dense) - Detached
+                dense_logits = aux['dense_scores'].mean(dim=1).detach()
+                target_probs = torch.nn.functional.softmax(dense_logits, dim=-1)
+                
+                # Student (Indexer)
+                indexer_log_probs = torch.nn.functional.log_softmax(aux['indexer_scores'], dim=-1)
+                
+                loss_aux += torch.nn.functional.kl_div(indexer_log_probs, target_probs, reduction='batchmean')
+        
+        loss = loss_main + loss_aux
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"Warning: Loss is {loss.item()} at step {step}. Skipping.")
@@ -364,34 +401,42 @@ def train_sparse_finetune(
         train_time += time.time() - step_start  
         
         # Evaluation
-        if step % steps_per_eval == steps_per_eval - 1:
+        if step % steps_per_eval == steps_per_eval - 1 and eval_func is not None:
             
             optimizer.eval() 
             model.eval() 
             
-            with torch.no_grad():
-                val_output, _ = model(data, train_test_split_index=train_test_split_index, mode='eval')
-                if isinstance(val_output, tuple): val_output = val_output[0]
-                val_output = val_output.view(-1, val_output.shape[-1])
+            classifier = NanoTabPFNClassifier(model, device)
+            scores = eval_func(classifier)
+            eval_history.append((train_time, scores))
+            score_str = " | ".join([f"{k} {v:7.4f}" for k,v in scores.items()])
+            print(f"time {train_time:7.1f}s | loss {loss.item():7.4f} | {score_str}")
+
+            if logger:
+                log_row = {
+                    'stage': 'sparse_finetune',
+                    'step': step,
+                    'time': train_time,
+                    'loss': loss.item(),
+                    'syn_acc': 0,
+                }
+                log_row.update(scores)
+                logger.log(log_row)
+            
+            # --- Early Stopping Check ---
+            current_score = scores.get('acc', 0.0)
+            if current_score > best_score:
+                best_score = current_score
+                patience_counter = 0
+                best_model_state = copy.deepcopy(model.state_dict())
+            else:
+                patience_counter += 1
+                print(f"No improvement in Score. Patience: {patience_counter}/{patience}")
                 
-                val_preds = val_output.argmax(dim=-1)
-                correct = (val_preds == targets).float().sum()
-                total = targets.shape[0]
-                val_acc = (correct / total).item()
-                val_loss = criterion(val_output, targets).mean().item()
-
-                print(f"Time {train_time:7.1f}s | Train Loss {loss.item():.4f} | Syn Val Loss {val_loss:.4f} | Syn Acc {val_acc:.4f}")
-
-                if logger:
-                    logger.log({
-                        'stage': 'sparse_finetune',
-                        'step': step,
-                        'time': train_time,
-                        'loss': loss.item(),
-                        'syn_acc': val_acc,
-                        'acc': val_acc,
-                        'roc_auc': 0, 'balanced_acc': 0
-                    })
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {step} steps.")
+                model.load_state_dict(best_model_state)
+                break
             
             model.train()
             optimizer.train()
@@ -400,8 +445,147 @@ def train_sparse_finetune(
     optimizer.eval() 
     model.eval()
     
-    return model, eval_history
+    return model, []
 
+
+def train_coordinate_block_descent(
+    model: NanoTabPFNDSAModel, 
+    prior: DataLoader, 
+    device: torch.device, 
+    lr_indexer: float = 1e-4, 
+    lr_tfm: float = 1e-4,
+    n_indexer_steps: int = 10,
+    n_tfm_steps: int = 10,
+    logger: Optional[CSVLogger] = None
+) -> Tuple[NanoTabPFNDSAModel, List]:
+    """
+    Implements Coordinate Block Descent (CBD) training for NanoTabPFNDSAModel.
+    
+    Theory:
+    Optimization of Sparse Attention models involves two distinct sets of parameters with different dynamics:
+    1. Indexer Parameters (theta_I): Select which tokens to attend to. Hard to train end-to-end due to discrete selection.
+    2. TFM Parameters (theta_M): The main model weights (Encoders, Attention, MLPs).
+    
+    CBD alternates between two blocks:
+    - Block 1 (Indexer Step): Fix theta_M, Minimize L_distill(theta_I; theta_M_fixed).
+      We use the dense attention scores (from theta_M) as a teacher to train the Indexer.
+    - Block 2 (TFM Step): Fix theta_I, Minimize L_task(theta_M; theta_I_fixed).
+      We use the fixed Indexer to select indices, and train the model on the main task (CrossEntropy).
+      
+    Args:
+        model: The NanoTabPFNDSAModel.
+        prior: DataLoader.
+        device: Torch device.
+        lr_indexer: Learning rate for Indexer.
+        lr_tfm: Learning rate for TFM.
+        n_indexer_steps: Number of steps per Indexer block.
+        n_tfm_steps: Number of steps per TFM block.
+        logger: Optional CSVLogger.
+    """
+    print(f"\n{'='*20}\nStarting Coordinate Block Descent Training\n{'='*20}")
+    print(f"Configuration: Indexer Steps={n_indexer_steps} (LR={lr_indexer}), TFM Steps={n_tfm_steps} (LR={lr_tfm})")
+    
+    # 1. Parameter Splitting
+    indexer_params = []
+    tfm_params = []
+    for name, param in model.named_parameters():
+        if 'indexer' in name:
+            indexer_params.append(param)
+        else:
+            tfm_params.append(param)
+            
+    # 2. Optimizers
+    opt_indexer = schedulefree.AdamWScheduleFree(indexer_params, lr=lr_indexer, weight_decay=0.0)
+    opt_tfm = schedulefree.AdamWScheduleFree(tfm_params, lr=lr_tfm, weight_decay=0.0)
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    train_time = 0.0
+    
+    # Ensure model is on device
+    model.to(device)
+    
+    cycle_len = n_indexer_steps + n_tfm_steps
+    
+    try:
+        for step, full_data in enumerate(prior):
+            step_start = time.time()
+            
+            cycle_pos = step % cycle_len
+            
+            # --- BLOCK SELECTION ---
+            if cycle_pos < n_indexer_steps:
+                # --- BLOCK 1: INDEXER OPTIMIZATION ---
+                mode = 'indexer'
+                opt_indexer.train()
+                opt_tfm.eval()
+                model.train()
+                
+                train_test_split_index = full_data["train_test_split_index"]
+                data = (full_data["x"].to(device), full_data["y"][:, :train_test_split_index].to(device))
+                
+                opt_indexer.zero_grad()
+                
+                _, aux_data_list = model(data, train_test_split_index=train_test_split_index, mode='warmup')
+                
+                loss = torch.tensor(0.0, device=device)
+                for aux in aux_data_list:
+                    if 'indexer_scores' in aux and 'dense_scores' in aux:
+                        dense_logits = aux['dense_scores'].mean(dim=1).detach()
+                        target_probs = torch.nn.functional.softmax(dense_logits, dim=-1)
+                        indexer_log_probs = torch.nn.functional.log_softmax(aux['indexer_scores'], dim=-1)
+                        loss += torch.nn.functional.kl_div(indexer_log_probs, target_probs, reduction='batchmean')
+                
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(indexer_params, 1.0)
+                    opt_indexer.step()
+                    
+                log_stage = 'cbd_indexer'
+
+            else:
+                # --- BLOCK 2: TFM OPTIMIZATION ---
+                mode = 'tfm'
+                opt_indexer.eval()
+                opt_tfm.train()
+                model.train()
+                
+                train_test_split_index = full_data["train_test_split_index"]
+                data = (full_data["x"].to(device), full_data["y"][:, :train_test_split_index].to(device))
+                targets = full_data["y"].to(device)
+                targets = targets[:, train_test_split_index:].reshape((-1,)).to(torch.long)
+                
+                opt_tfm.zero_grad()
+                
+                output, _ = model(data, train_test_split_index=train_test_split_index, mode='sparse_train')
+                if isinstance(output, tuple): output = output[0]
+                output = output.view(-1, output.shape[-1])
+                
+                loss = criterion(output, targets).mean()
+                
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(tfm_params, 1.0)
+                    opt_tfm.step()
+                    
+                log_stage = 'cbd_tfm'
+
+            train_time += time.time() - step_start
+            
+            if step % 10 == 0:
+                print(f"Step {step:4d} | Block: {mode.upper():7s} | Time: {train_time:6.1f}s | Loss: {loss.item():.4f}")
+                if logger:
+                    logger.log({'stage': log_stage, 'step': step, 'time': train_time, 'loss': loss.item()})
+
+    except KeyboardInterrupt:
+        print("Training interrupted by user.")
+        
+    # Final consistency
+    opt_indexer.eval()
+    opt_tfm.eval()
+    model.eval()
+    
+    return model, []
 
 class PriorDumpDataLoader(DataLoader):
     """
@@ -455,8 +639,8 @@ class PriorDumpDataLoader(DataLoader):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train NanoTabPFN models.")
-    parser.add_argument("--model_type", type=str, choices=["base", "dsa", "both"], default="both", help="Type of model to train")
-    parser.add_argument("--max_time", type=float, default=600.0, help="Maximum training time in seconds")
+    parser.add_argument("--model_type", type=str, choices=["base", "dsa", "both", "cbd"], default="dsa", help="Type of model to train")
+    parser.add_argument("--num_steps", type=int, default=1000, help="Number of training steps")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -468,11 +652,10 @@ if __name__ == "__main__":
         models_to_run = [args.model_type]
 
     for m_type in models_to_run:
-        print(f"\n{'='*20}\nTraining {m_type} model for {args.max_time} seconds\n{'='*20}")
+        print(f"\n{'='*20}\nTraining {m_type} model for {args.num_steps} steps\n{'='*20}")
         
         # 1. Re-initialize data loader for each run to ensure fairness
-        # Note: We use a larger num_steps to ensure we don't run out of data before max_time
-        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=100000, batch_size=32, device=device)
+        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=args.num_steps, batch_size=32, device=device)
         
         # 2. Setup Logger
         # We added 'syn_acc' (Synthetic Accuracy) to the logs as it's our primary metric now
@@ -495,7 +678,8 @@ if __name__ == "__main__":
                 prior, 
                 lr=4e-3, 
                 steps_per_eval=25, 
-                max_time=args.max_time, 
+                patience=5,
+                eval_func=evaluate_model,
                 logger=logger
             )
             
@@ -511,26 +695,58 @@ if __name__ == "__main__":
                 use_dsa=True
             ).to(device)
             
-            # Split time budget: 10% Warmup, 90% Finetuning
-            warmup_time = 0.1 * args.max_time
-            finetune_time = 0.9 * args.max_time
+            # Split steps: 10% Warmup, 90% Finetuning
+            warmup_steps = int(0.1 * args.num_steps)
+            finetune_steps = args.num_steps - warmup_steps
+            
+            # Re-init prior for warmup
+            prior_warmup = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=warmup_steps, batch_size=32, device=device)
             
             # Stage A: Warmup (Distillation with KL Divergence)
             train_indexer_warmup(
                 model, 
-                prior, 
+                prior_warmup, 
                 device, 
-                max_time=warmup_time, 
+                patience=5,
                 logger=logger
             )
+            
+            # Re-init prior for finetune
+            prior_finetune = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=finetune_steps, batch_size=32, device=device)
             
             # Stage B: Finetune (Sparse Training with Internal Eval)
             model, history = train_sparse_finetune(
                 model, 
-                prior, 
+                prior_finetune, 
                 device, 
-                max_time=finetune_time, 
                 steps_per_eval=25, 
+                lr=1e-5,
+                patience=5,
+                eval_func=evaluate_model,
+                logger=logger
+            )
+            
+            
+        elif m_type == "cbd":
+            # --- Coordinate Block Descent ---
+            model = NanoTabPFNDSAModel(
+                embedding_size=96,
+                num_attention_heads=4,
+                mlp_hidden_size=192,
+                num_layers=3,
+                num_outputs=2,
+                top_k=64,
+                use_dsa=True
+            ).to(device)
+            
+            model, history = train_coordinate_block_descent(
+                model,
+                prior,
+                device,
+                lr_indexer=1e-4,
+                lr_tfm=1e-4,
+                n_indexer_steps=50, # Train indexer for 50 steps
+                n_tfm_steps=50,     # Then train TFM for 50 steps
                 logger=logger
             )
 
